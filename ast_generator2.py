@@ -97,16 +97,19 @@ class ASTGenerator:
         Setup include paths for the parser based on the directory structure:
         
         Expected structure:
-        - goal/src_analysis/src/apl001/, apl002/, etc. (source folders)
-        - goal/src_analysis/include/ (global headers with nested folders)
-        - goal/src_analysis/libapl/ (libapl implementation files)
-        - goal/moove_header/ (middleware headers with nested folders)
+        PROJECT/
+        ├── moove_header/              (middleware headers at project root)
+        └── src_analysis/
+            ├── include/               (global headers, may have nested folders)
+            └── src/
+                ├── apl001/, apl002/  (source folders)
+                └── libapl/           (libapl implementation files - same level as apl folders)
         
         1. The folder itself (where C files are) - for headers in the same directory
         2. Local header folder in the current folder
         3. Global header folder (src_analysis/include with all nested subdirectories)
-        4. Middleware headers folder (moove_header with all nested subdirectories)
-        5. libapl folder (src_analysis/libapl)
+        4. Middleware headers folder (moove_header at project root with all nested subdirectories)
+        5. libapl folder (src_analysis/src/libapl - same level as apl folders)
         6. System include paths
         """
         self.include_paths = []
@@ -185,40 +188,16 @@ class ASTGenerator:
                         self.include_paths.append(str(subdir))
                 print(f"  Found {name} with {len(mw_subdirs)} directories (including nested)")
         
-        # 4. libapl folder - check for src_analysis/libapl structure first
-        libapl_path = None
-        if "src_analysis" in str(folder_path):
-            # Try to find src_analysis/libapl relative to current folder
-            path_parts = folder_path.parts
-            if "src_analysis" in path_parts:
-                src_idx = path_parts.index("src_analysis")
-                src_analysis_base = Path(*path_parts[:src_idx + 1])
-                libapl_path = src_analysis_base / "libapl"
+        # 4. libapl folder - always in src_analysis/src/libapl/ (same level as apl folders)
+        # Since we know the structure, we only check the correct path
+        libapl_path = self.base_path / "src_analysis" / "src" / "libapl"
         
-        # Also check at base_path level
-        libapl_base_path = self.base_path / "src_analysis" / "libapl"
-        if libapl_base_path.exists():
-            libapl_path = libapl_base_path
-        
-        # Add src_analysis/libapl if found
-        if libapl_path and libapl_path.exists():
+        if libapl_path.exists():
             if str(libapl_path) not in self.include_paths:
                 self.include_paths.append(str(libapl_path))
-                print(f"  Added src_analysis/libapl folder: {libapl_path}")
-        
-        # Fallback: check for libapl in current folder
-        local_libapl = folder_path / "libapl"
-        if local_libapl.exists():
-            if str(local_libapl) not in self.include_paths:
-                self.include_paths.append(str(local_libapl))
-                print(f"  Added local libapl folder: {local_libapl}")
-        
-        # Fallback: check if libapl is at base level
-        libapl_base = self.base_path / "libapl"
-        if libapl_base.exists():
-            if str(libapl_base) not in self.include_paths:
-                self.include_paths.append(str(libapl_base))
-                print(f"  Added base libapl folder: {libapl_base}")
+                print(f"  Added src_analysis/src/libapl folder: {libapl_path}")
+        else:
+            print(f"  Note: libapl folder not found at {libapl_path}")
         
         # 5. System include paths (for standard C headers)
         self.include_paths.extend([
@@ -275,6 +254,115 @@ class ASTGenerator:
                 header_files.extend(header_folder.glob(ext))
         
         return sorted(header_files)
+    
+    def extract_includes_from_file(self, file_path: Path) -> List[Tuple[str, bool]]:
+        """
+        Extract #include statements from a C file.
+        Returns list of tuples: (header_name, is_system_header)
+        is_system_header: True for <header.h>, False for "header.h"
+        """
+        includes = []
+        try:
+            with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
+                for line in f:
+                    line = line.strip()
+                    # Check for #include <header.h> or #include "header.h"
+                    if line.startswith('#include'):
+                        # Remove #include and whitespace
+                        include_part = line[8:].strip()
+                        
+                        # Check if it's a system header <...> or local header "..."
+                        if include_part.startswith('<') and include_part.endswith('>'):
+                            # System header: <stdio.h>
+                            header_name = include_part[1:-1]
+                            includes.append((header_name, True))
+                        elif include_part.startswith('"') and include_part.endswith('"'):
+                            # Local header: "myheader.h"
+                            header_name = include_part[1:-1]
+                            includes.append((header_name, False))
+        except Exception as e:
+            print(f"  Warning: Could not read {file_path}: {e}")
+        
+        return includes
+    
+    def find_header_in_paths(self, header_name: str, include_paths: List[str]) -> Optional[Path]:
+        """
+        Check if a header file exists in any of the include paths.
+        Returns the full path if found, None otherwise.
+        """
+        # Try with the header name as-is
+        for include_path in include_paths:
+            header_path = Path(include_path) / header_name
+            if header_path.exists() and header_path.is_file():
+                return header_path
+        
+        # Also try with common header extensions if not already present
+        if not any(header_name.endswith(ext) for ext in ['.h', '.H', '.hpp', '.HPP', '.hxx', '.HXX']):
+            for ext in ['.h', '.H', '.hpp', '.HPP']:
+                for include_path in include_paths:
+                    header_path = Path(include_path) / f"{header_name}{ext}"
+                    if header_path.exists() and header_path.is_file():
+                        return header_path
+        
+        return None
+    
+    def check_included_headers(self, c_files: List[Path]) -> Dict[str, List[Tuple[str, bool, Optional[str]]]]:
+        """
+        Check all included headers in C files.
+        Returns a dictionary mapping C file -> list of (header_name, found, location)
+        """
+        print("\n" + "="*80)
+        print("Checking Included Headers")
+        print("="*80)
+        
+        results = {}
+        all_includes = {}  # Track all unique includes across files
+        
+        for c_file in c_files:
+            includes = self.extract_includes_from_file(c_file)
+            file_results = []
+            
+            print(f"\nChecking includes in: {c_file.name}")
+            
+            for header_name, is_system_header in includes:
+                if is_system_header:
+                    # System headers (like <stdio.h>) - usually found in system paths
+                    # We'll mark as found (libclang will handle system headers)
+                    print(f"  ✓ System header <{header_name}> (assumed available)")
+                    file_results.append((header_name, True, "system"))
+                    all_includes[header_name] = (True, "system")
+                else:
+                    # Local headers - check if they exist
+                    header_path = self.find_header_in_paths(header_name, self.include_paths)
+                    if header_path:
+                        print(f"  ✓ Header \"{header_name}\" found at: {header_path}")
+                        file_results.append((header_name, True, str(header_path)))
+                        all_includes[header_name] = (True, str(header_path))
+                    else:
+                        print(f"  ✗ Header \"{header_name}\" NOT FOUND in include paths")
+                        file_results.append((header_name, False, None))
+                        all_includes[header_name] = (False, None)
+            
+            results[str(c_file)] = file_results
+        
+        # Summary
+        print("\n" + "-"*80)
+        print("Summary:")
+        found_count = sum(1 for found, _ in all_includes.values() if found)
+        not_found = [name for name, (found, _) in all_includes.items() if not found]
+        
+        print(f"  Total unique headers checked: {len(all_includes)}")
+        print(f"  Found: {found_count}")
+        print(f"  Not found: {len(not_found)}")
+        
+        if not_found:
+            print("\n  Missing headers:")
+            for header in not_found:
+                print(f"    - {header}")
+        
+        print("="*80 + "\n")
+        
+        return results
     
     def get_cursor_location(self, cursor: Cursor) -> str:
         """Get file location string for a cursor"""
@@ -769,9 +857,15 @@ class ASTGenerator:
         # Setup include paths
         self.setup_include_paths(folder_path)
         
+        # Step 0: Check included headers in C files before parsing
+        c_files = self.find_c_files(folder_path)
+        if c_files:
+            print(f"\nFound {len(c_files)} C file(s) to check")
+            self.check_included_headers(c_files)
+            print("Header checking complete. Starting AST generation...\n")
+        
         # Step 1: Parse all C files in the folder
         print("Step 1: Parsing C files...")
-        c_files = self.find_c_files(folder_path)
         print(f"Found {len(c_files)} C file(s)")
         
         for c_file in c_files:
@@ -786,15 +880,17 @@ class ASTGenerator:
             self.parse_file(header_file)
         
         # Step 3: Parse libapl C files if they exist
+        # libapl is always in src_analysis/src/libapl/ (same level as apl folders)
         print("\nStep 3: Parsing libapl files...")
-        libapl_path = folder_path / "libapl"
+        libapl_path = self.base_path / "src_analysis" / "src" / "libapl"
+        
         if libapl_path.exists():
             libapl_files = self.find_c_files(libapl_path)
-            print(f"Found {len(libapl_files)} libapl C file(s)")
+            print(f"Found {len(libapl_files)} libapl C file(s) in {libapl_path}")
             for libapl_file in libapl_files:
                 self.parse_file(libapl_file)
         else:
-            print("No libapl folder found")
+            print(f"No libapl folder found at {libapl_path}")
         
         # Step 4: Find main function
         print("\nStep 4: Finding main function...")
